@@ -1,0 +1,23 @@
+# Visual Studio & Build Outputs
+[Oo]bj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+.vscode/
+
+# Ignore compiled binaries in root
+*.exe
+*.dll
+*.pdb
+
+# Bin directory - keep config and patch_dir templates, ignore compiled exe
+bin/*.exe
+bin/*.dll
+bin/*.pdb
+
+# Temp files
+*.log
+*.tmp
+*.bak
