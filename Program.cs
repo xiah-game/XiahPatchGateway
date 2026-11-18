@@ -7,6 +7,7 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Text.RegularExpressions;
 using System.Data.SqlClient;
+using System.Runtime.InteropServices;
 
 namespace XiahPatchGateway
 {
@@ -22,6 +23,16 @@ namespace XiahPatchGateway
         private static readonly Dictionary<string, CacheEntry> Md5Cache = new Dictionary<string, CacheEntry>();
         private static readonly object CacheLock = new object();
 
+        struct IpBanRule
+        {
+            public string Target;
+            public string Reason;
+        }
+
+        private static readonly object BanCacheLock = new object();
+        private static DateTime BanCacheExpiresAtUtc = DateTime.MinValue;
+        private static List<IpBanRule> CachedIpBanRules = new List<IpBanRule>();
+
         struct CacheEntry
         {
             public DateTime LastWriteTime;
@@ -29,12 +40,51 @@ namespace XiahPatchGateway
             public string Md5;
         }
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetStdHandle(int nStdHandle);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+
+        private const int STD_INPUT_HANDLE = -10;
+        private const uint ENABLE_QUICK_EDIT_MODE = 0x0040;
+        private const uint ENABLE_EXTENDED_FLAGS = 0x0080;
+
+        /// <summary>
+        /// 彻底禁用 Windows 控制台快速编辑模式 (QuickEdit Mode)
+        /// 防止鼠标无意在控制台黑窗中单击选中文字导致整个网关进程被内核挂起、阻断所有玩家更新请求
+        /// </summary>
+        private static void DisableConsoleQuickEdit()
+        {
+            try
+            {
+                IntPtr handle = GetStdHandle(STD_INPUT_HANDLE);
+                uint mode;
+                if (GetConsoleMode(handle, out mode))
+                {
+                    mode &= ~ENABLE_QUICK_EDIT_MODE;
+                    mode |= ENABLE_EXTENDED_FLAGS;
+                    SetConsoleMode(handle, mode);
+                }
+            }
+            catch { }
+        }
+
         static void Main(string[] args)
         {
             Console.Title = "Xiah Oriental Fantasy 资源网关服务";
+            DisableConsoleQuickEdit();
             
-            // 设置输出编码为 UTF8 以支持中文显示
-            Console.OutputEncoding = Encoding.UTF8;
+            // 兼容 Windows 8.1 / 7 / Server 经典控制台，使用系统默认编码（GBK/CP936），避免 UTF-8 下点阵字体显示为希腊字母乱码
+            try
+            {
+                Console.OutputEncoding = Encoding.Default;
+                Console.InputEncoding = Encoding.Default;
+            }
+            catch { }
 
             // 动态解析端口，如果本地同级有 xiah.ini，自动读取 PatchUrl 里的端口
             Port = GetPortFromIni();
@@ -271,9 +321,22 @@ namespace XiahPatchGateway
                 try
                 {
                     string relPath = filepath.Substring(PatchDir.Length).TrimStart(Path.DirectorySeparatorChar).Replace('\\', '/');
+                    string fileName = Path.GetFileName(relPath);
                     
-                    // 1. 过滤清单文件本身，防止递归死循环哈希校验
-                    if (relPath.Equals("manifest.json", StringComparison.OrdinalIgnoreCase))
+                    // 1. 过滤清单文件本身、崩溃转储与运行日志、激活态的 d3d9.dll，以及玩家本地个人配置文件 (xiah.ini / cheat*.ini / launcher*)
+                    //    (保留 config.ini 等游戏数据配置正常下发；xiah.ini 若本地缺失会由客户端首次启动自动生成标准基础配置)
+                    if (relPath.Equals("manifest.json", StringComparison.OrdinalIgnoreCase) ||
+                        fileName.Equals("d3d9.dll", StringComparison.OrdinalIgnoreCase) ||
+                        fileName.Equals("xiah.ini", StringComparison.OrdinalIgnoreCase) ||
+                        fileName.Equals("cheat.ini", StringComparison.OrdinalIgnoreCase) ||
+                        (fileName.StartsWith("cheat_", StringComparison.OrdinalIgnoreCase) && fileName.EndsWith(".ini", StringComparison.OrdinalIgnoreCase)) ||
+                        fileName.Equals("launcher.ini", StringComparison.OrdinalIgnoreCase) ||
+                        fileName.Equals("launcher_accounts.dat", StringComparison.OrdinalIgnoreCase) ||
+                        fileName.Equals("Xiah.log", StringComparison.OrdinalIgnoreCase) ||
+                        fileName.Equals("Xiah_Close.log", StringComparison.OrdinalIgnoreCase) ||
+                        fileName.Equals("Xiah_TEST.log", StringComparison.OrdinalIgnoreCase) ||
+                        relPath.EndsWith(".dmp", StringComparison.OrdinalIgnoreCase) ||
+                        relPath.EndsWith("_d3d9.log", StringComparison.OrdinalIgnoreCase))
                     {
                         continue;
                     }
@@ -352,7 +415,7 @@ namespace XiahPatchGateway
             {
                 try
                 {
-                    using (var stream = File.OpenRead(filename))
+                    using (var stream = new FileStream(filename, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
                     {
                         var hash = md5.ComputeHash(stream);
                         StringBuilder sb = new StringBuilder();
@@ -363,8 +426,9 @@ namespace XiahPatchGateway
                         return sb.ToString();
                     }
                 }
-                catch
+                catch (Exception ex)
                 {
+                    Log(ConsoleColor.DarkYellow, "哈希告警", string.Format("文件 {0} 暂时无法读取计算指纹 (可能正在写入或被独占): {1}", Path.GetFileName(filename), ex.Message));
                     return "";
                 }
             }
@@ -470,7 +534,7 @@ namespace XiahPatchGateway
             string username = context.Request.QueryString["username"] ?? "";
             username = username.Trim();
 
-            if (string.IsNullOrEmpty(username) || username.Length < 4 || username.Length > 12)
+            if (string.IsNullOrEmpty(username) || username.Length < 4 || username.Length > 12 || !Regex.IsMatch(username, "^[a-zA-Z0-9]+$"))
             {
                 SendJsonResponse(response, (int)HttpStatusCode.BadRequest, "{\"exists\":false,\"message\":\"参数无效\"}");
                 return;
@@ -580,9 +644,17 @@ namespace XiahPatchGateway
                     return;
                 }
 
+                string connStr = GetDbConnectionString();
+                string banReason;
+                if (IsIpBannedForRegister(connStr, clientIp, out banReason))
+                {
+                    Log(ConsoleColor.Red, "注册拦截", string.Format("拒绝封禁 IP [{0}] 注册请求{1}", clientIp, string.IsNullOrEmpty(banReason) ? "" : ("，原因: " + banReason)));
+                    SendJsonResponse(response, 403, "{\"success\":false,\"message\":\"当前网络IP已被限制注册账号\"}");
+                    return;
+                }
+
                 Log(ConsoleColor.Green, "注册请求", string.Format("IP: {0} 尝试注册账号: {1} 邮箱: {2}", clientIp, username, email));
 
-                string connStr = GetDbConnectionString();
                 if (DbRegisterAccount(connStr, username, password, email, out errorMsg))
                 {
                     Log(ConsoleColor.Green, "注册成功", string.Format("IP: {0} 账号 {1} 注册成功！", clientIp, username));
@@ -655,9 +727,9 @@ namespace XiahPatchGateway
                 errorMsg = "账号必须为4-12位英文或数字";
                 return false;
             }
-            if (password.Length < 4 || password.Length > 12)
+            if (password.Length < 4 || password.Length > 12 || !Regex.IsMatch(password, "^[a-zA-Z0-9]+$"))
             {
-                errorMsg = "密码长度必须在4-12位之间";
+                errorMsg = "密码必须为4-12位英文或数字";
                 return false;
             }
             if (string.IsNullOrEmpty(email) || !Regex.IsMatch(email, @"^\S+@\S+\.\S+$"))
@@ -815,6 +887,123 @@ namespace XiahPatchGateway
             {
                 try { response.Close(); } catch { }
             }
+        }
+
+        private static string NormalizeIpAddress(string rawIp)
+        {
+            if (string.IsNullOrWhiteSpace(rawIp)) return "";
+            string ip = rawIp.Trim();
+            if (ip.StartsWith("::ffff:", StringComparison.OrdinalIgnoreCase))
+                ip = ip.Substring(7);
+            return ip;
+        }
+
+        private static bool IsLoopbackIp(string ip)
+        {
+            if (string.IsNullOrEmpty(ip)) return true;
+            if (ip == "::1" || ip.Equals("localhost", StringComparison.OrdinalIgnoreCase) || ip == "0.0.0.0")
+                return true;
+            if (ip.StartsWith("127.", StringComparison.Ordinal))
+                return true;
+            return false;
+        }
+
+        private static bool IsIpRuleMatch(string ip, string ruleTarget)
+        {
+            if (string.IsNullOrEmpty(ip) || string.IsNullOrEmpty(ruleTarget)) return false;
+            string rule = ruleTarget.Trim();
+            int starIdx = rule.IndexOf('*');
+            if (starIdx >= 0)
+            {
+                string prefix = rule.Substring(0, starIdx);
+                return !string.IsNullOrEmpty(prefix) && ip.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
+            }
+            return string.Equals(ip, rule, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool IsIpBannedForRegister(string connStr, string clientIp, out string banReason)
+        {
+            banReason = "";
+            string ip = NormalizeIpAddress(clientIp);
+            if (IsLoopbackIp(ip)) return false;
+
+            List<IpBanRule> rules = null;
+            DateTime nowUtc = DateTime.UtcNow;
+            bool needRefresh = false;
+            lock (BanCacheLock)
+            {
+                if (nowUtc < BanCacheExpiresAtUtc)
+                {
+                    rules = CachedIpBanRules;
+                }
+                else
+                {
+                    needRefresh = true;
+                }
+            }
+
+            if (needRefresh)
+            {
+                var freshRules = new List<IpBanRule>();
+                try
+                {
+                    using (var conn = new SqlConnection(connStr))
+                    {
+                        conn.Open();
+                        const string sql =
+                            "IF OBJECT_ID('dbo.SECURITY_BAN_LIST', 'U') IS NOT NULL " +
+                            "SELECT szTarget, ISNULL(szReason, '') " +
+                            "FROM dbo.SECURITY_BAN_LIST WITH (NOLOCK) " +
+                            "WHERE bActive = 1 AND bBanType = 2 " +
+                            "AND (dtExpireTime IS NULL OR dtExpireTime > GETDATE())";
+                        using (var cmd = new SqlCommand(sql, conn))
+                        {
+                            cmd.CommandTimeout = 3;
+                            using (var reader = cmd.ExecuteReader())
+                            {
+                                while (reader.Read())
+                                {
+                                    string target = reader.IsDBNull(0) ? "" : reader.GetString(0).Trim();
+                                    string reason = reader.IsDBNull(1) ? "" : reader.GetString(1).Trim();
+                                    if (!string.IsNullOrEmpty(target))
+                                    {
+                                        freshRules.Add(new IpBanRule { Target = target, Reason = reason });
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    lock (BanCacheLock)
+                    {
+                        CachedIpBanRules = freshRules;
+                        BanCacheExpiresAtUtc = DateTime.UtcNow.AddSeconds(10);
+                        rules = CachedIpBanRules;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log(ConsoleColor.Yellow, "封禁缓存", "查询 IP 封禁表失败，放行本次校验: " + ex.Message);
+                    lock (BanCacheLock)
+                    {
+                        BanCacheExpiresAtUtc = DateTime.UtcNow.AddSeconds(5);
+                        rules = CachedIpBanRules;
+                    }
+                }
+            }
+
+            if (rules != null)
+            {
+                foreach (var rule in rules)
+                {
+                    if (IsIpRuleMatch(ip, rule.Target))
+                    {
+                        banReason = rule.Reason;
+                        return true;
+                    }
+                }
+            }
+            return false;
         }
     }
 }
