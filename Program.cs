@@ -16,6 +16,11 @@ namespace XiahPatchGateway
         private static readonly string PatchDir = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "patch_dir");
         private static int Port = 8080;
 
+        private const string ROUTE_PATCH_CONFIG = "patch_config";
+        private const string INI_SECTION_PATCH = "Patch";
+        private const string INI_SECTION_NETWORK = "Network";
+        private const string INI_KEY_DOWNLOAD_BASE_URL = "DownloadBaseUrl";
+
         // 内存缓存的最新的 JSON 清单字符串，降低玩家请求时的 IO 压力
         private static string CurrentManifestJson = "";
 
@@ -101,6 +106,8 @@ namespace XiahPatchGateway
             Console.ResetColor();
             Console.WriteLine("[物理路径] 补丁根目录 : " + PatchDir);
             Console.WriteLine("[网关监听] 外部请求IP : http://*:" + Port + "/");
+            string configuredBaseUrl = GetDownloadBaseUrlFromIni();
+            Console.WriteLine("[补丁分发] 下载根路径 : " + (string.IsNullOrEmpty(configuredBaseUrl) ? "未配置外部源，由本机 patch_dir 直接分发" : configuredBaseUrl));
             Console.WriteLine("[提示说明] 1. 只需要将客户端更新文件按原目录层级放入 patch_dir 中即可。");
             Console.WriteLine("[提示说明] 2. 服务端每次启动都会在 patch_dir 下自动生成物理静态 manifest.json");
             Console.WriteLine("[提示说明]    这意味您甚至可以直接使用 Nginx 或 IIS 指向 patch_dir 来提供更新！");
@@ -220,6 +227,14 @@ namespace XiahPatchGateway
             if (requestedPath.Equals("check_account", StringComparison.OrdinalIgnoreCase) || requestedPath.EndsWith("/check_account", StringComparison.OrdinalIgnoreCase))
             {
                 HandleCheckAccountRequest(context);
+                return;
+            }
+
+            // 0.8 下发客户端补丁下载根路径配置（仅返回 baseUrl，严禁下发防盗链 Referer）
+            if (requestedPath.Equals(ROUTE_PATCH_CONFIG, StringComparison.OrdinalIgnoreCase) ||
+                requestedPath.EndsWith("/" + ROUTE_PATCH_CONFIG, StringComparison.OrdinalIgnoreCase))
+            {
+                HandlePatchConfigRequest(context);
                 return;
             }
 
@@ -434,10 +449,122 @@ namespace XiahPatchGateway
             }
         }
 
+        /// <summary>
+        /// 解析服务端 config.ini 物理路径（优先同级目录，其次回退上级目录以兼容多级输出结构）
+        /// </summary>
+        private static string ResolveConfigIniPath()
+        {
+            string baseDir = AppDomain.CurrentDomain.BaseDirectory;
+            string configPath = Path.Combine(baseDir, "config.ini");
+            if (File.Exists(configPath))
+            {
+                return configPath;
+            }
+
+            // 去除末尾分隔符后再取父目录，避免 .NET GetParent 返回自身目录路径
+            string trimmedBase = baseDir.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            DirectoryInfo parentDir = Directory.GetParent(trimmedBase);
+            if (parentDir != null)
+            {
+                string parentConfig = Path.Combine(parentDir.FullName, "config.ini");
+                if (File.Exists(parentConfig))
+                {
+                    return parentConfig;
+                }
+            }
+
+            return configPath;
+        }
+
+        /// <summary>
+        /// 剥离 INI 配置项中的行内分号注释及首尾引号
+        /// </summary>
+        private static string StripIniValueCommentAndQuotes(string rawValue)
+        {
+            if (string.IsNullOrEmpty(rawValue)) return "";
+            string val = rawValue.Trim();
+            int commentIdx = val.IndexOf(';');
+            if (commentIdx >= 0)
+            {
+                val = val.Substring(0, commentIdx).Trim();
+            }
+            return val.Trim('"', '\'');
+        }
+
+        /// <summary>
+        /// 实时读取 config.ini 中的 [Patch] DownloadBaseUrl 配置，支持运维修改后免重启即时生效
+        /// </summary>
+        private static string GetDownloadBaseUrlFromIni()
+        {
+            string configPath = ResolveConfigIniPath();
+            if (!File.Exists(configPath)) return "";
+
+            try
+            {
+                string currentSection = "";
+                foreach (string rawLine in File.ReadAllLines(configPath, Encoding.UTF8))
+                {
+                    string trimmed = rawLine.Trim();
+                    if (string.IsNullOrEmpty(trimmed) || trimmed.StartsWith(";")) continue;
+
+                    if (trimmed.StartsWith("[") && trimmed.EndsWith("]"))
+                    {
+                        currentSection = trimmed.Substring(1, trimmed.Length - 2).Trim();
+                        continue;
+                    }
+
+                    bool isTargetSection = currentSection.Equals(INI_SECTION_PATCH, StringComparison.OrdinalIgnoreCase) ||
+                                           currentSection.Equals(INI_SECTION_NETWORK, StringComparison.OrdinalIgnoreCase);
+                    if (!isTargetSection) continue;
+
+                    var parts = trimmed.Split(new[] { '=' }, 2);
+                    if (parts.Length != 2 || !parts[0].Trim().Equals(INI_KEY_DOWNLOAD_BASE_URL, StringComparison.OrdinalIgnoreCase)) continue;
+
+                    string val = StripIniValueCommentAndQuotes(parts[1]);
+                    if (val.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                        val.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                    {
+                        return val.EndsWith("/") ? val : (val + "/");
+                    }
+                    return "";
+                }
+            }
+            catch (Exception ex)
+            {
+                Log(ConsoleColor.Yellow, "配置读取", "解析 DownloadBaseUrl 失败: " + ex.Message);
+            }
+            return "";
+        }
+
+        /// <summary>
+        /// 处理客户端补丁根路径配置下发请求（GET /patch_config）
+        /// 安全约束：仅下发下载根路径，严禁在此接口中返回任何防盗链 Referer 凭据
+        /// </summary>
+        private static void HandlePatchConfigRequest(HttpListenerContext context)
+        {
+            HttpListenerResponse response = context.Response;
+            string clientIp = context.Request.RemoteEndPoint.Address.ToString();
+            response.AddHeader("Access-Control-Allow-Origin", "*");
+
+            try
+            {
+                string baseUrl = GetDownloadBaseUrlFromIni();
+                string safeUrl = baseUrl.Replace("\\", "\\\\").Replace("\"", "\\\"");
+                string json = string.Format("{{\"baseUrl\":\"{0}\"}}", safeUrl);
+                Log(ConsoleColor.Green, "配置下发", string.Format("IP: {0} 获取补丁根路径 -> {1}", clientIp, string.IsNullOrEmpty(baseUrl) ? "(本机直连)" : baseUrl));
+                SendJsonResponse(response, (int)HttpStatusCode.OK, json);
+            }
+            catch (Exception ex)
+            {
+                Log(ConsoleColor.Red, "配置异常", string.Format("IP: {0} 读取补丁配置失败: {1}", clientIp, ex.Message));
+                SendJsonResponse(response, (int)HttpStatusCode.InternalServerError, "{\"baseUrl\":\"\"}");
+            }
+        }
+
         private static int GetPortFromIni()
         {
             // 1. 优先读取服务端的核心配置文件 config.ini
-            string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.ini");
+            string configPath = ResolveConfigIniPath();
             if (File.Exists(configPath))
             {
                 try
@@ -821,13 +948,7 @@ namespace XiahPatchGateway
         /// </summary>
         private static string GetDbConnectionString()
         {
-            string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.ini");
-            if (!File.Exists(configPath))
-            {
-                DirectoryInfo parentDir = Directory.GetParent(AppDomain.CurrentDomain.BaseDirectory);
-                string parentConfig = Path.Combine(parentDir != null ? parentDir.FullName : "", "config.ini");
-                if (File.Exists(parentConfig)) configPath = parentConfig;
-            }
+            string configPath = ResolveConfigIniPath();
 
             string server = "127.0.0.1";
             string user = "sa";
